@@ -2,230 +2,395 @@ import pygame
 import numpy as np
 import math
 
-# Initialize Pygame
 pygame.init()
 
-# Window settings
+# -----------------------
+# Configuration & Setup
+# -----------------------
 WIDTH = 1000
-HEIGHT = 1000
+HEIGHT = 600
 GRID_COLS = 50
 CELL_SIZE = WIDTH // GRID_COLS
+GRID_ROWS = HEIGHT // CELL_SIZE
+
 FPS = 60
 
 # Colors
-BLACK = (0, 0, 0)
 WHITE = (255, 255, 255)
-GRAY = (150, 150, 150)
-CURSOR_COLOR = (150, 150, 150, 128)
-BUTTON_RAISE_COLOR = (0, 200, 0)
-BUTTON_LOWER_COLOR = (200, 0, 0)
-SLIDER_TRACK_COLOR = (150, 150, 150)
-SLIDER_HANDLE_COLOR = (255, 255, 255)
-SLIDER_HANDLE_BORDER_COLOR = (0, 0, 0)
+BLACK = (0, 0, 0)
+BLUE  = (0, 100, 200)
+GRAY  = (150, 150, 150)
 
-# Set up display with resizable window
 screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
-pygame.display.set_caption("RippleBot")
+pygame.display.set_caption("Side-View Water (Fills from Bottom)")
 clock = pygame.time.Clock()
-
-# Set up font for mode display
 font = pygame.font.Font(None, 36)
 
-# Terrain setup: 50 points across, generated with a sine wave
+# -----------------------
+# Terrain Setup (1D)
+# -----------------------
 base_height = HEIGHT * 4 // 5
 amplitude = HEIGHT // 25
-terrain_points = np.zeros(GRID_COLS, dtype=int)
 num_waves = 2
-for i in range(GRID_COLS):
-    x = i * CELL_SIZE
+
+terrain_points = np.zeros(GRID_COLS, dtype=int)
+for c in range(GRID_COLS):
+    x = c * CELL_SIZE
     angle = x * (2 * math.pi * num_waves / WIDTH)
-    terrain_points[i] = base_height + int(amplitude * math.sin(angle))
-# Height at x=WIDTH
-angle = WIDTH * (2 * math.pi * num_waves / WIDTH)
-terrain_height_at_width = base_height + int(amplitude * math.sin(angle))
+    # Original sine wave
+    raw_value = base_height + int(amplitude * math.sin(angle))
+    # Snap to a multiple of CELL_SIZE for stair steps:
+    terrain_points[c] = (raw_value // CELL_SIZE) * CELL_SIZE
 
-# Admin mode state and deformation settings
+# Also snap the right edge:
+terrain_right_edge = base_height + int(amplitude * math.sin(WIDTH * (2 * math.pi * num_waves / WIDTH)))
+terrain_right_edge = (terrain_right_edge // CELL_SIZE) * CELL_SIZE
+
+# -----------------------
+# 2D Arrays
+# -----------------------
+# coverage[r,c] = fraction from the BOTTOM of cell [r,c] that is occupied by terrain.
+# capacity[r,c] = 1 - coverage[r,c]
+# water[r,c] in [0..capacity[r,c]] is how much water fills from the BOTTOM up.
+coverage = np.zeros((GRID_ROWS, GRID_COLS), dtype=float)
+capacity = np.zeros((GRID_ROWS, GRID_COLS), dtype=float)
+water    = np.zeros((GRID_ROWS, GRID_COLS), dtype=float)
+
+# Settled logic to reduce flicker
+settled = np.zeros((GRID_ROWS, GRID_COLS), dtype=bool)
+settle_count = np.zeros((GRID_ROWS, GRID_COLS), dtype=int)
+
+# Flow parameters
+MaxValue = 1.0
+MaxCompression = 0.25
+MinValue = 0.001
+MinFlow  = 0.0005
+MaxFlow  = 0.2
+FlowSpeed = 0.2
+SETTLE_THRESHOLD = 8
+
+# -----------------------
+# Compute Coverage (from the bottom)
+# -----------------------
+def compute_coverage():
+    for c in range(GRID_COLS):
+        t_y = terrain_points[c]  # screen coord from top
+        for r in range(GRID_ROWS):
+            # Cell spans [cell_top, cell_bottom] in screen coords
+            cell_top    = r * CELL_SIZE
+            cell_bottom = (r + 1) * CELL_SIZE
+
+            # Because we want coverage from the bottom:
+            #   if terrain is above cell_bottom => no terrain in this cell => coverage=0
+            #   if terrain is below cell_top => cell fully terrain => coverage=1
+            #   otherwise partial coverage
+            if t_y <= cell_top:
+                # Terrain line is above entire cell => fully terrain from the bottom
+                coverage[r, c] = 1.0
+            elif t_y >= cell_bottom:
+                # Terrain line is below entire cell => no terrain
+                coverage[r, c] = 0.0
+            else:
+                # Partial coverage from the bottom
+                terrain_pixels = cell_bottom - t_y
+                cell_height    = cell_bottom - cell_top
+                fraction = terrain_pixels / float(cell_height)
+                coverage[r, c] = fraction
+
+            capacity[r, c] = 1.0 - coverage[r, c]
+            if water[r, c] > capacity[r, c]:
+                water[r, c] = capacity[r, c]
+
+compute_coverage()
+
+# -----------------------
+# Water Simulation
+# -----------------------
+def calculate_vertical_flow_value(a, b, max_cap):
+    s = a + b
+    if s <= MaxValue:
+        desired = MaxValue
+    elif s < 2*MaxValue + MaxCompression:
+        desired = (MaxValue*MaxValue + s*MaxCompression)/(MaxValue + MaxCompression)
+    else:
+        desired = (s + MaxCompression)/2.0
+    return min(desired, max_cap)
+
+def simulate_water(iterations=3):
+    global water, coverage, capacity, settled, settle_count
+    rows, cols = water.shape
+    global settled, settle_count
+
+    for _ in range(iterations):
+        diffs = np.zeros_like(water)
+
+        for r in range(rows):
+            for c in range(cols):
+                if capacity[r, c] <= 0:
+                    water[r, c] = 0
+                    continue
+                if water[r, c] < MinValue:
+                    water[r, c] = 0
+                    settled[r, c] = False
+                    continue
+                if settled[r, c]:
+                    continue
+
+                start_val = water[r, c]
+                remaining = start_val
+
+                # 1) Flow Down
+                if r + 1 < rows and capacity[r+1, c] > 0:
+                    below_val = water[r+1, c]
+                    desired = calculate_vertical_flow_value(remaining, below_val, capacity[r+1, c])
+                    flow = desired - below_val
+                    if below_val > 0 and flow > MinFlow:
+                        flow *= FlowSpeed
+                    flow = max(flow, 0)
+                    flow = min(flow, remaining, MaxFlow)
+                    if flow > 0:
+                        remaining -= flow
+                        diffs[r, c]     -= flow
+                        diffs[r+1, c]   += flow
+
+                if remaining < MinValue:
+                    diffs[r, c] -= remaining
+                    continue
+
+                # 2) Flow Left
+                if c - 1 >= 0 and capacity[r, c-1] > 0:
+                    left_val = water[r, c-1]
+                    flow = (remaining - left_val)/4.0
+                    if flow > MinFlow:
+                        flow *= FlowSpeed
+                    flow = max(flow, 0)
+                    flow = min(flow, remaining, MaxFlow)
+                    if left_val + flow > capacity[r, c-1]:
+                        flow = capacity[r, c-1] - left_val
+                        flow = max(flow, 0)
+                    if flow > 0:
+                        remaining -= flow
+                        diffs[r, c]     -= flow
+                        diffs[r, c-1]   += flow
+
+                if remaining < MinValue:
+                    diffs[r, c] -= remaining
+                    continue
+
+                # 3) Flow Right
+                if c + 1 < cols and capacity[r, c+1] > 0:
+                    right_val = water[r, c+1]
+                    flow = (remaining - right_val)/3.0
+                    if flow > MinFlow:
+                        flow *= FlowSpeed
+                    flow = max(flow, 0)
+                    flow = min(flow, remaining, MaxFlow)
+                    if right_val + flow > capacity[r, c+1]:
+                        flow = capacity[r, c+1] - right_val
+                        flow = max(flow, 0)
+                    if flow > 0:
+                        remaining -= flow
+                        diffs[r, c]     -= flow
+                        diffs[r, c+1]   += flow
+
+                if remaining < MinValue:
+                    diffs[r, c] -= remaining
+                    continue
+
+                # 4) Flow Up (pressure)
+                if r - 1 >= 0 and capacity[r-1, c] > 0:
+                    above_val = water[r-1, c]
+                    desired = calculate_vertical_flow_value(remaining, above_val, capacity[r-1, c])
+                    flow = remaining - desired
+                    if flow > MinFlow:
+                        flow *= FlowSpeed
+                    flow = max(flow, 0)
+                    flow = min(flow, remaining, MaxFlow)
+                    if above_val + flow > capacity[r-1, c]:
+                        flow = capacity[r-1, c] - above_val
+                        flow = max(flow, 0)
+                    if flow > 0:
+                        remaining -= flow
+                        diffs[r, c]     -= flow
+                        diffs[r-1, c]   += flow
+
+                # Settling check
+                if abs(remaining - start_val) < 1e-9:
+                    settle_count[r, c] += 1
+                    if settle_count[r, c] >= SETTLE_THRESHOLD:
+                        settled[r, c] = True
+                else:
+                    settle_count[r, c] = 0
+                    settled[r, c] = False
+
+        water += diffs
+        water[water < 0] = 0
+        for r2 in range(rows):
+            for c2 in range(cols):
+                if water[r2, c2] < MinValue:
+                    water[r2, c2] = 0
+                    settled[r2, c2] = False
+                if water[r2, c2] > capacity[r2, c2]:
+                    water[r2, c2] = capacity[r2, c2]
+                    settled[r2, c2] = False
+
+def build_stepped_polygon(terrain_points, cell_size, total_height, right_edge):
+    """
+    Creates a polygon that transitions from column to column with 
+    horizontal + vertical steps, ensuring no angled lines.
+    
+    - terrain_points: array of snapped terrain heights for each column
+    - cell_size: width of each column
+    - total_height: bottom of the screen (e.g., HEIGHT)
+    - right_edge: snapped terrain height at the far right boundary
+    """
+    poly = []
+    # Start from the bottom-left corner
+    poly.append((0, total_height))
+
+    # For each column from 0 to second-last, create two steps:
+    #  1) horizontal from (x_curr, y_curr) to (x_next, y_curr)
+    #  2) vertical   from (x_next, y_curr) to (x_next, y_next)
+    for c in range(len(terrain_points) - 1):
+        x_curr = c * cell_size
+        x_next = (c + 1) * cell_size
+        y_curr = terrain_points[c]
+        y_next = terrain_points[c + 1]
+
+        # Horizontal step
+        poly.append((x_curr, y_curr))
+        poly.append((x_next, y_curr))
+
+        # Vertical step
+        poly.append((x_next, y_next))
+
+    # Handle the last column
+    last_x = (len(terrain_points) - 1) * cell_size
+    last_y = terrain_points[-1]
+    # Step horizontally to the far right
+    poly.append((last_x, last_y))
+    poly.append((len(terrain_points) * cell_size, last_y))
+
+    # Then a vertical line to right_edge
+    poly.append((len(terrain_points) * cell_size, right_edge))
+    # Finally close at the bottom-right corner
+    poly.append((len(terrain_points) * cell_size, total_height))
+
+    return poly
+
+
+# -----------------------
+# Add Water (click)
+# -----------------------
+def add_water_at_cell(r, c, amount=0.1):
+    if 0 <= r < GRID_ROWS and 0 <= c < GRID_COLS:
+        free = capacity[r, c] - water[r, c]
+        flow = min(amount, free)
+        water[r, c] += flow
+        settled[r, c] = False
+        settle_count[r, c] = 0
+        print(f"Added {flow:.2f} to row={r}, col={c}")
+
+# -----------------------
+# Main Loop
+# -----------------------
 admin_mode = False
-deform_radius = 1
-min_deform_radius = 1
-max_deform_radius = 5
-falloff_extension = 2
-deform_mode = "raise"
-
-# UI elements for admin mode
-button_rect = pygame.Rect(10, 60, 120, 40)
-slider_track_rect = pygame.Rect(10, 120, 100, 15)
-slider_handle_radius = 10
-slider_dragging = False
-
-# Threshold for "near terrain" (in pixels)
-NEAR_TERRAIN_THRESHOLD = 50
-
-# Main loop
 running = True
 while running:
-    # Event handling
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_a:
                 admin_mode = not admin_mode
-            elif event.key == pygame.K_LEFTBRACKET:
-                deform_radius = max(min_deform_radius, deform_radius - 1)
-            elif event.key == pygame.K_RIGHTBRACKET:
-                deform_radius = min(max_deform_radius, deform_radius + 1)
-            elif event.key == pygame.K_PLUS or event.key == pygame.K_EQUALS:
-                deform_mode = "raise"
-            elif event.key == pygame.K_MINUS:
-                deform_mode = "lower"
         elif event.type == pygame.VIDEORESIZE:
             WIDTH, HEIGHT = event.size
             CELL_SIZE = WIDTH // GRID_COLS
+            GRID_ROWS = HEIGHT // CELL_SIZE
             screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
+            # Recompute or regenerate terrain as needed
             base_height = HEIGHT * 4 // 5
             amplitude = HEIGHT // 25
-            for i in range(GRID_COLS):
-                x = i * CELL_SIZE
+            for cc in range(GRID_COLS):
+                x = cc * CELL_SIZE
                 angle = x * (2 * math.pi * num_waves / WIDTH)
-                terrain_points[i] = base_height + int(amplitude * math.sin(angle))
-            angle = WIDTH * (2 * math.pi * num_waves / WIDTH)
-            terrain_height_at_width = base_height + int(amplitude * math.sin(angle))
-        elif event.type == pygame.MOUSEBUTTONDOWN:
-            if admin_mode and button_rect.collidepoint(event.pos):
-                deform_mode = "lower" if deform_mode == "raise" else "raise"
-            if admin_mode:
-                handle_x = slider_track_rect.x + int((deform_radius - min_deform_radius) / (max_deform_radius - min_deform_radius) * slider_track_rect.width)
-                handle_pos = (handle_x, slider_track_rect.centery)
-                mouse_x, mouse_y = event.pos
-                if ((mouse_x - handle_x) ** 2 + (mouse_y - handle_pos[1]) ** 2) <= slider_handle_radius ** 2:
-                    slider_dragging = True
-        elif event.type == pygame.MOUSEBUTTONUP:
-            slider_dragging = False
-        elif event.type == pygame.MOUSEMOTION and slider_dragging:
-            mouse_x, _ = event.pos
-            relative_x = max(0, min(mouse_x - slider_track_rect.x, slider_track_rect.width))
-            radius_range = max_deform_radius - min_deform_radius
-            new_radius = min_deform_radius + (relative_x / slider_track_rect.width) * radius_range
-            deform_radius = max(min_deform_radius, min(max_deform_radius, round(new_radius)))
+                raw_val = base_height + int(amplitude * math.sin(angle))
+                # Snap to cell boundary for a step:
+                terrain_points[cc] = (raw_val // CELL_SIZE) * CELL_SIZE
 
-    # Handle terrain painting in admin mode
-    if admin_mode and pygame.mouse.get_pressed()[0]:
-        mouse_x, mouse_y = pygame.mouse.get_pos()
-        if not button_rect.collidepoint((mouse_x, mouse_y)) and not slider_track_rect.collidepoint((mouse_x, mouse_y)):
-            terrain_idx = min(max(mouse_x // CELL_SIZE, 0), GRID_COLS - 1)
-            terrain_height = terrain_points[terrain_idx] if terrain_idx < GRID_COLS else terrain_height_at_width
-            is_near_terrain = abs(mouse_y - terrain_height) <= NEAR_TERRAIN_THRESHOLD
-            if is_near_terrain:
-                new_height = min(max(mouse_y, 50), HEIGHT - 50)
-                extended_radius = deform_radius + falloff_extension
-                for offset in range(-extended_radius, extended_radius + 1):
-                    idx = terrain_idx + offset
-                    if 0 <= idx < GRID_COLS:
-                        if abs(offset) <= deform_radius:
-                            influence = 1.0 - abs(offset) / (deform_radius + 1)
-                        else:
-                            extra_distance = abs(offset) - deform_radius
-                            influence = max(0, 1.0 - (extra_distance + deform_radius) / (deform_radius + falloff_extension + 1))
-                        if influence > 0:
-                            current_height = terrain_points[idx]
-                            if deform_mode == "lower" and current_height < new_height:
-                                terrain_points[idx] = int(current_height + (new_height - current_height) * influence)
-                            elif deform_mode == "raise" and current_height > new_height:
-                                terrain_points[idx] = int(current_height - (current_height - new_height) * influence)
-                    if idx >= GRID_COLS:
-                        offset_at_width = idx - (GRID_COLS - 1)
-                        if abs(offset_at_width) <= deform_radius:
-                            influence = 1.0 - abs(offset_at_width) / (deform_radius + 1)
-                        else:
-                            extra_distance = abs(offset_at_width) - deform_radius
-                            influence = max(0, 1.0 - (extra_distance + deform_radius) / (deform_radius + falloff_extension + 1))
-                        if influence > 0:
-                            current_height = terrain_height_at_width
-                            if deform_mode == "lower" and current_height < new_height:
-                                terrain_height_at_width = int(current_height + (new_height - current_height) * influence)
-                            elif deform_mode == "raise" and current_height > new_height:
-                                terrain_height_at_width = int(current_height - (current_height - new_height) * influence)
+            # Also snap right edge:
+            tmp_edge = base_height + int(amplitude * math.sin(WIDTH * (2 * math.pi * num_waves / WIDTH)))
+            terrain_right_edge = (tmp_edge // CELL_SIZE) * CELL_SIZE
+
+            coverage.resize((GRID_ROWS, GRID_COLS), refcheck=False)
+            capacity.resize((GRID_ROWS, GRID_COLS), refcheck=False)
+            water2 = np.zeros((GRID_ROWS, GRID_COLS), dtype=float)
+            water[:] = 0
+            settled.resize((GRID_ROWS, GRID_COLS), refcheck=False)
+            settled[:] = False
+            settle_count.resize((GRID_ROWS, GRID_COLS), refcheck=False)
+            settle_count[:] = 0
+            compute_coverage()
+
+    # Add water at mouse if not in admin mode
+    if not admin_mode and pygame.mouse.get_pressed()[0]:
+        mx, my = pygame.mouse.get_pos()
+        r = my // CELL_SIZE
+        c = mx // CELL_SIZE
+        add_water_at_cell(r, c, 0.5)
+
+    # Simulate water
+    simulate_water(iterations=3)
 
     # Clear screen
     screen.fill(WHITE)
 
-    # Draw terrain
-    poly_points = [(0, HEIGHT)]
-    for x in range(GRID_COLS):
-        poly_points.append((x * CELL_SIZE, terrain_points[x]))
-    poly_points.append((WIDTH, terrain_height_at_width))
-    poly_points.append((WIDTH, HEIGHT))
+    # -----------------------
+    # Render Water
+    #  - We fill from the BOTTOM of each cell up to water[r,c]*CELL_HEIGHT
+    #  - Also do a "downflow hack": if the cell above has water, visually fill this cell
+    # -----------------------
+    rows, cols = water.shape
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            wval = water[r, c]
+            if wval > 0:
+                cell_top    = r * CELL_SIZE
+                cell_bottom = (r + 1) * CELL_SIZE
+                cell_height = cell_bottom - cell_top
+
+                # fraction from bottom that is terrain
+                terr_pixels = coverage[r, c] * cell_height
+                water_pixels = wval * cell_height
+
+                # "Downflow hack" if the cell above has water
+                if r > 0 and water[r - 1, c] > 0:
+                    water_pixels = cell_height - terr_pixels
+
+                float_top = (cell_bottom - terr_pixels - water_pixels)
+                float_bottom = (cell_bottom - terr_pixels)
+
+                int_top = int(round(float_top))
+                int_bottom = int(round(float_bottom))
+                int_height = max(0, int_bottom - int_top + 1)
+
+                rect = pygame.Rect(c * CELL_SIZE, int_top, CELL_SIZE, int_height)
+                pygame.draw.rect(screen, BLUE, rect)
+
+    # -----------------------
+    # Render Terrain
+    # -----------------------
+    # Render Terrain with pure steps
+    poly_points = build_stepped_polygon(
+        terrain_points, 
+        CELL_SIZE, 
+        HEIGHT, 
+        terrain_right_edge
+    )
     pygame.draw.polygon(screen, BLACK, poly_points)
 
-    # Admin mode grid of squares
-    if admin_mode:
-        top_points = [(x * CELL_SIZE, terrain_points[x]) for x in range(GRID_COLS)]
-        top_points.append((WIDTH, terrain_height_at_width))
-        for x in range(GRID_COLS + 1):
-            x_pos = x * CELL_SIZE if x < GRID_COLS else WIDTH
-            start = (x_pos, top_points[x][1])
-            end = (x_pos, HEIGHT)
-            pygame.draw.line(screen, GRAY, start, end, 1)
-        num_horizontal = 5
-        for level in range(1, num_horizontal + 1):
-            y_positions = []
-            for x in range(GRID_COLS):
-                height_diff = HEIGHT - terrain_points[x]
-                y_pos = terrain_points[x] + (height_diff * level // (num_horizontal + 1))
-                y_positions.append(y_pos)
-            height_diff = HEIGHT - terrain_height_at_width
-            y_pos = terrain_height_at_width + (height_diff * level // (num_horizontal + 1))
-            y_positions.append(y_pos)
-            for x in range(GRID_COLS):
-                start = (x * CELL_SIZE, y_positions[x])
-                end_x = (x + 1) * CELL_SIZE if x + 1 < GRID_COLS else WIDTH
-                end = (end_x, y_positions[x + 1])
-                pygame.draw.line(screen, GRAY, start, end, 1)
 
-        # Handle hover effect for toggle button and slider
-        mouse_x, mouse_y = pygame.mouse.get_pos()
-        is_hovering_button = button_rect.collidepoint((mouse_x, mouse_y))
-        is_hovering_slider = slider_track_rect.collidepoint((mouse_x, mouse_y))
-        if is_hovering_button or is_hovering_slider:
-            pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND)
-        else:
-            pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_ARROW)
-
-        # Draw deformation area circle at cursor only if near terrain
-        terrain_idx = min(max(mouse_x // CELL_SIZE, 0), GRID_COLS - 1)
-        terrain_height = terrain_points[terrain_idx] if terrain_idx < GRID_COLS else terrain_height_at_width
-        if abs(mouse_y - terrain_height) <= NEAR_TERRAIN_THRESHOLD:
-            circle_radius = (deform_radius * 2 + 1) * CELL_SIZE // 2
-            circle_surface = pygame.Surface((circle_radius * 2, circle_radius * 2), pygame.SRCALPHA)
-            pygame.draw.circle(circle_surface, CURSOR_COLOR, (circle_radius, circle_radius), circle_radius)
-            screen.blit(circle_surface, (mouse_x - circle_radius, mouse_y - circle_radius))
-
-        # Draw toggle button
-        button_color = BUTTON_RAISE_COLOR if deform_mode == "raise" else BUTTON_LOWER_COLOR
-        if is_hovering_button:
-            # Lighten the button color on hover
-            button_color = tuple(min(255, c + 50) for c in button_color)
-        pygame.draw.rect(screen, button_color, button_rect, border_radius=5)
-        pygame.draw.rect(screen, BLACK, button_rect, 2, border_radius=5)
-        button_text = font.render(deform_mode.capitalize(), True, BLACK)
-        button_text_rect = button_text.get_rect(center=button_rect.center)
-        screen.blit(button_text, button_text_rect)
-
-        # Draw slider
-        pygame.draw.rect(screen, SLIDER_TRACK_COLOR, slider_track_rect, border_radius=5)
-        handle_x = slider_track_rect.x + int((deform_radius - min_deform_radius) / (max_deform_radius - min_deform_radius) * slider_track_rect.width)
-        handle_pos = (handle_x, slider_track_rect.centery)
-        pygame.draw.circle(screen, SLIDER_HANDLE_COLOR, handle_pos, slider_handle_radius)
-        pygame.draw.circle(screen, SLIDER_HANDLE_BORDER_COLOR, handle_pos, slider_handle_radius, 2)
-        radius_font_size = int((HEIGHT // 25) * 0.75)
-        radius_font = pygame.font.Font(None, radius_font_size)
-        radius_text = radius_font.render(f"Radius: {deform_radius}", True, BLACK)
-        screen.blit(radius_text, (slider_track_rect.x, slider_track_rect.y + 25))
-
-    # Update display
     pygame.display.flip()
     clock.tick(FPS)
 
-# Cleanup
 pygame.quit()
