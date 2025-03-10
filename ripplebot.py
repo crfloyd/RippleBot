@@ -31,7 +31,7 @@ font = pygame.font.Font(None, 36)
 # -----------------------
 base_height = HEIGHT * 4 // 5
 amplitude = HEIGHT // 25
-num_waves = 2
+num_waves = 4
 
 terrain_points = np.zeros(GRID_COLS, dtype=int)
 for c in range(GRID_COLS):
@@ -60,15 +60,15 @@ settle_count = np.zeros((GRID_ROWS, GRID_COLS), dtype=int)
 
 # Flow parameters
 MaxValue = 1.0
-MaxCompression = 0.25
+MaxCompression = 0.5
 MinValue = 0.001
 MinFlow  = 0.0005
-MaxFlow  = 0.2
-FlowSpeed = 0.2
-SETTLE_THRESHOLD = 8
+MaxFlow  = 0.5
+FlowSpeed = 0.5
+SETTLE_THRESHOLD = 200
 
 # NEW: Horizontal flow multiplier (increase this value to speed up lateral spreading)
-HORIZONTAL_FLOW_MULTIPLIER = 4.0
+HORIZONTAL_FLOW_MULTIPLIER = 1.0
 
 # -----------------------
 # Compute Coverage (from the bottom)
@@ -154,8 +154,9 @@ def simulate_water(iterations=3):
 
                 # 2) Flow Left (modified)
                 if c - 1 >= 0 and capacity[r, c - 1] > 0:
+                    up_val = water[r-1, c]
                     left_val = water[r, c - 1]
-                    flow = ((remaining - left_val) / 4.0) * HORIZONTAL_FLOW_MULTIPLIER
+                    flow = ((remaining - left_val)) * HORIZONTAL_FLOW_MULTIPLIER
                     if flow > MinFlow:
                         flow *= FlowSpeed
                     flow = max(flow, 0)
@@ -175,7 +176,7 @@ def simulate_water(iterations=3):
                 # 3) Flow Right (modified)
                 if c + 1 < cols and capacity[r, c + 1] > 0:
                     right_val = water[r, c + 1]
-                    flow = ((remaining - right_val) / 3.0) * HORIZONTAL_FLOW_MULTIPLIER
+                    flow = ((remaining - right_val) ) * HORIZONTAL_FLOW_MULTIPLIER
                     if flow > MinFlow:
                         flow *= FlowSpeed
                     flow = max(flow, 0)
@@ -239,7 +240,6 @@ def add_water_at_cell(r, c, amount=0.1):
         water[r, c] += flow
         settled[r, c] = False
         settle_count[r, c] = 0
-        print(f"Added {flow:.2f} to row={r}, col={c}")
 
 # -----------------------
 # Main Loop
